@@ -7,13 +7,13 @@ import random
 import datetime
 import geopandas as gpd
 from shapely.geometry import Point, LineString
-from folium.plugins import TimestampedGeoJson
+import osmnx as ox
+import networkx as nx
 
 # Backend engines
 from utils.osm_loader import load_road_network, load_buildings
 from feasibility_engine.feasibility import FeasibilityEngine
 from graph_modification.modify_graph import GraphModificationEngine
-from simulation_engine.simulator import TrafficSimulator
 
 # --- Page Config ---
 st.set_page_config(
@@ -22,18 +22,27 @@ st.set_page_config(
 )
 
 @st.cache_resource(show_spinner="Loading Base Map & Building Footprints from OSM (Caching for low latency)...")
-def get_city_data(place_name="Kathriguppe, Bangalore, India"):
-    G = load_road_network(place_name, dist=5000)
-    buildings = load_buildings(place_name)
+def get_city_data(place_name="Kathriguppe, Bangalore, India", point=None, dist=5000):
+    G = load_road_network(place_name, point=point, dist=dist)
+    buildings = load_buildings(place_name, point=point, dist=dist)
     return G, buildings
 
-def init_map(bounds=None):
-    """Initializes a Folium map centered on Kathriguppe Junction area."""
-    # Approximate Center for Kathriguppe / Mysore Road
-    m = folium.Map(location=[12.9360, 77.5400], zoom_start=13, tiles="cartodbpositron")
+def init_map(center=None, bounds=None):
+    """Initializes a Folium map centered on the current study area."""
+    # If no center is provided, try to calculate it from the bounds for better accuracy
+    if not center and bounds:
+        lat_c = (bounds[0][0] + bounds[1][0]) / 2
+        lon_c = (bounds[0][1] + bounds[1][1]) / 2
+        map_center = [lat_c, lon_c]
+    else:
+        map_center = center if center else [12.9360, 77.5400]
+        
+    m = folium.Map(location=map_center, zoom_start=14, tiles="cartodbpositron")
     
     if bounds:
-        folium.Rectangle(bounds, color='#3388ff', weight=2, fill=False, dash_array='5, 5', tooltip='10x10km Data Boundary').add_to(m)
+        # Tight boundary fitting to avoid the "world map" view
+        m.fit_bounds(bounds, padding=[20, 20])
+        folium.Rectangle(bounds, color='#3388ff', weight=2, fill=False, dash_array='5, 5', tooltip='Data Boundary').add_to(m)
         
     
     # Add Search Geocoder for location lookups
@@ -103,16 +112,89 @@ def process_geometry(geom, buildings_gdf, G, feas_eng, mod_eng, road_width=8, is
         "projected_coords": projected_coords
     }
 
+def prepare_graph_for_export(G):
+    """Converts a graph to a GraphML-compatible format by stringifying complex types (geometries, lists)."""
+    G_export = G.copy()
+    for u, v, k, data in G_export.edges(data=True, keys=True):
+        for attr, value in data.items():
+            if isinstance(value, (list, LineString, Point)):
+                data[attr] = str(value)
+    for n, data in G_export.nodes(data=True):
+        for attr, value in data.items():
+            if isinstance(value, (list, LineString, Point)):
+                data[attr] = str(value)
+    return G_export
+
 def main():
     st.title("Traffic Digital Twin: Infrastructure Engine")
     st.markdown("**Team**: Engineering")
     
+    # --- Session State Management ---
+    if 'active_place' not in st.session_state:
+        st.session_state.active_place = "Kathriguppe, Bangalore, India"
+    if 'active_point' not in st.session_state:
+        st.session_state.active_point = None
+    if 'active_dist' not in st.session_state:
+        st.session_state.active_dist = 5000
+    if 'last_clicked' not in st.session_state:
+        st.session_state.last_clicked = None
+
     # Lazy Load Backend
-    G, buildings = get_city_data("Kathriguppe, Bangalore, India")
+    G, buildings = get_city_data(
+        place_name=st.session_state.active_place, 
+        point=st.session_state.active_point, 
+        dist=st.session_state.active_dist
+    )
     feas_eng = FeasibilityEngine(buildings)
     
+    # Region Engine Sidebar
+    st.sidebar.header("🗺️ Region Configuration")
+    search_place = st.sidebar.text_input("Search Location / Area", value=st.session_state.active_place)
+    
+    col_coords = st.sidebar.columns(2)
+    with col_coords[0]:
+        st.markdown(f"**Lat:** {st.session_state.last_clicked[0]:.4f}" if st.session_state.last_clicked else "**Lat:** -")
+    with col_coords[1]:
+        st.markdown(f"**Lon:** {st.session_state.last_clicked[1]:.4f}" if st.session_state.last_clicked else "**Lon:** -")
+    
+    use_clicked = st.sidebar.button("📍 Use Last Clicked Point", use_container_width=True)
+    if use_clicked and st.session_state.last_clicked:
+        st.session_state.active_point = st.session_state.last_clicked
+        st.session_state.active_place = None # Prioritize point
+        st.sidebar.success("Updated to pinpoint location!")
+        
+    search_dist = st.sidebar.slider("Search Radius (km)", 1, 10, st.session_state.active_dist // 1000) * 1000
+    
+    load_region = st.sidebar.button("🚀 Load New Region", type="primary", use_container_width=True)
+    if load_region:
+        if not use_clicked: # If we didn't just update to a point, use the text search
+            st.session_state.active_place = search_place
+            st.session_state.active_point = None
+        st.session_state.active_dist = search_dist
+        st.rerun()
+
+    # Base Region download in sidebar always red
+    if 'G' in locals() and G is not None:
+        st.sidebar.divider()
+        st.sidebar.subheader("📦 Region Export")
+        try:
+            G_base_export = prepare_graph_for_export(G)
+            base_graphml = "\n".join(nx.generate_graphml(G_base_export))
+            st.sidebar.download_button(
+                label="Download Base Region (.graphml)",
+                data=base_graphml,
+                file_name=f"base_map_export.graphml",
+                mime="application/xml",
+                use_container_width=True,
+                type="primary"
+            )
+        except Exception as e:
+            st.sidebar.error(f"Base Export Error: {e}")
+
+    st.sidebar.divider()
+    
     # Global Config Sidebar
-    st.sidebar.header("Global Engine Configuration")
+    st.sidebar.header("⚙️ Engine Configuration")
     global_road_width = st.sidebar.slider("Road Width (meters)", 2, 30, 8, help="Used by Feasibility Engine to calculate collision buffers.")
     global_is_oneway = st.sidebar.checkbox("One-Way Infrastructure", value=False, help="If checked, the network routes traffic only in the direction the route was drawn.")
     
@@ -121,8 +203,8 @@ def main():
     minx, miny, maxx, maxy = buildings_latlon.total_bounds
     map_bounds = [[miny, minx], [maxy, maxx]]
     
-    # Create the four tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["Proposal Analyzer", "Smart Suggestion", "Original Engine", "Digital Twin Simulation"])
+    # Create the three tabs
+    tab1, tab2, tab3 = st.tabs(["Proposal Comparison", "Smart Architect", "Intervention Engine"])
     
     with tab1:
         st.header("Proposal Analyzer")
@@ -131,8 +213,10 @@ def main():
         col1, col2 = st.columns([2, 1])
         
         with col1:
-            m1 = init_map(map_bounds)
+            m1 = init_map(center=st.session_state.active_point if st.session_state.active_point else [12.9360, 77.5400], bounds=map_bounds)
             output1 = st_folium(m1, width=800, height=500, key="map_analyzer")
+            if output1 and output1.get('last_clicked'):
+                st.session_state.last_clicked = (output1['last_clicked']['lat'], output1['last_clicked']['lng'])
             
         with col2:
             st.subheader("Analysis & Comparison")
@@ -154,6 +238,7 @@ def main():
                             mod_eng = GraphModificationEngine(G)
                             geom = drawing['geometry']
                             metrics = process_geometry(geom, buildings, G, feas_eng, mod_eng, road_width=global_road_width, is_oneway=global_is_oneway)
+                            metrics['mod_eng'] = mod_eng # Store engine for download later
                             
                             ptypes = [p1_type, p2_type, p3_type]
                             ptype = ptypes[i] if i < len(ptypes) else "Surface Road"
@@ -204,6 +289,23 @@ def main():
                     df_display.columns = ["Proposal", "Type", "Length", "Bldg Collisions", "Traffic Score"]
                     st.dataframe(df_display, hide_index=True)
                     
+                    st.write("### Download Proposal Models")
+                    cols_dl = st.columns(len(results))
+                    for i, res in enumerate(results):
+                        with cols_dl[i]:
+                            # Generate GraphML
+                            G_export_p = prepare_graph_for_export(res['mod_eng'].G)
+                            graphml_str = "\n".join(nx.generate_graphml(G_export_p))
+                            st.download_button(
+                                label=f"💾 {res['name']}",
+                                data=graphml_str,
+                                file_name=f"{res['name'].lower().replace(' ', '_')}.graphml",
+                                mime="application/xml",
+                                key=f"dl_{i}",
+                                type="primary",
+                                use_container_width=True
+                            )
+                    
                 else:
                     st.warning("Please draw at least TWO proposals (lines or polygons) on the map before comparing.")
                     
@@ -214,8 +316,10 @@ def main():
         col3, col4 = st.columns([2, 1])
         
         with col3:
-            m2 = init_map(map_bounds)
+            m2 = init_map(center=st.session_state.active_point if st.session_state.active_point else [12.9360, 77.5400], bounds=map_bounds)
             output2 = st_folium(m2, width=800, height=500, key="map_suggestion")
+            if output2 and output2.get('last_clicked'):
+                st.session_state.last_clicked = (output2['last_clicked']['lat'], output2['last_clicked']['lng'])
             
         with col4:
             st.subheader("AI Suggestion")
@@ -273,7 +377,7 @@ def main():
                         
                         if collisions > 0:
                             st.markdown("### Collided Buildings Identified")
-                            coll_map = init_map(map_bounds)
+                            coll_map = init_map(center=st.session_state.active_point if st.session_state.active_point else [12.9360, 77.5400], bounds=map_bounds)
                             coords = geom['coordinates']
                             lonlat_coords = coords[0] if ctype == 'Polygon' else coords
                             
@@ -306,8 +410,10 @@ def main():
             generate_btn_orig = st.button("Run Impact Analysis", type="primary", use_container_width=True, key="btn_run_orig")
 
         with col5:
-            m3 = init_map(map_bounds)
+            m3 = init_map(center=st.session_state.active_point if st.session_state.active_point else [12.9360, 77.5400], bounds=map_bounds)
             output3 = st_folium(m3, width=800, height=600, key="map_original")
+            if output3 and output3.get('last_clicked'):
+                st.session_state.last_clicked = (output3['last_clicked']['lat'], output3['last_clicked']['lng'])
             
         if generate_btn_orig:
             with col6:
@@ -344,7 +450,7 @@ def main():
                     if not is_feasible:
                         st.error(f"**FEASIBILITY FAILED**\n\nThe proposed route intersects with {len(collisions)} existing building footprint(s). Please modify geometry.")
                         st.markdown("### Collision Map")
-                        fail_map = init_map(map_bounds)
+                        fail_map = init_map(center=st.session_state.active_point if st.session_state.active_point else [12.9360, 77.5400], bounds=map_bounds)
                         if geom_type == 'LineString':
                             folium.PolyLine([(pt[1], pt[0]) for pt in lonlat_coords], color="orange", weight=4).add_to(fail_map)
                         elif geom_type == 'Polygon':
@@ -365,6 +471,8 @@ def main():
                         
                         st.success("**NETWORK GRAPH UPDATED**")
                         
+                        # Removed old sidebar download from here (now global)
+                        
                         new_connections = report.get('New Connections Spliced', 0)
                         distance_saved = round(new_connections * 1.5 + random.uniform(0.5, 2.5), 2)
                         
@@ -383,154 +491,51 @@ Status: Approved & Spliced
 - New Connections Spliced: {new_connections}
 - Est. Travel Distance Saved: {distance_saved}%
 """
-                        st.download_button(
-                            label="Download Impact Report",
-                            data=report_content,
-                            file_name="intervention_report.md",
-                            mime="text/markdown"
-                        )
-                        
-                        import networkx as nx
-                        try:
-                            graphml_string = "\n".join(nx.generate_graphml(mod_eng.G))
+                        st.markdown("### Export Results")
+                        col_dl1, col_dl2 = st.columns(2)
+                        with col_dl1:
                             st.download_button(
-                                label="Download Modified Infra (.graphml)",
-                                data=graphml_string,
-                                file_name="modified_network.graphml",
-                                mime="application/xml"
+                                label="Download Impact Report",
+                                data=report_content,
+                                file_name="intervention_report.md",
+                                mime="text/markdown",
+                                use_container_width=True,
+                                type="primary"
                             )
-                        except Exception:
-                            pass
+                        
+                        try:
+                            G_export_orig = prepare_graph_for_export(mod_eng.G)
+                            graphml_string = "\n".join(nx.generate_graphml(G_export_orig))
+                            with col_dl2:
+                                st.download_button(
+                                    label="Download Modified Infra (.graphml)",
+                                    data=graphml_string,
+                                    file_name="modified_network.graphml",
+                                    mime="application/xml",
+                                    use_container_width=True,
+                                    type="primary"
+                                )
+                            
+                            # SUMO Export
+                            with st.spinner("Generating SUMO compatible network..."):
+                                import io
+                                osm_buffer = io.BytesIO()
+                                ox.save_graph_xml(mod_eng.G, filepath="temp_sumo.osm")
+                                with open("temp_sumo.osm", "rb") as f:
+                                    osm_data = f.read()
+                                
+                                st.download_button(
+                                    label="📦 Export for SUMO (.osm)",
+                                    data=osm_data,
+                                    file_name="sumo_network.osm",
+                                    mime="application/xml",
+                                    help="Download this file and use 'netconvert --osm-files sumo_network.osm -o sumo_network.net.xml' to simulate in SUMO."
+                                )
+                        except Exception as e:
+                            st.warning(f"OSM XML Export skipped: {e}. **Tip**: Use the GraphML download above with SUMO's 'netconvert' tool for similar results.")
                 else:
                     st.warning("Please draw an infrastructure line or polygon on the map first.")
 
-    with tab4:
-        st.header("Digital Twin: Traffic Simulation")
-        st.info("Simulate traffic flow over time using stochastic modeling of vehicles. This module compares the original road network straight against your proposed infrastructure.")
-        
-        col7, col8 = st.columns([2, 1])
-        with col8:
-            st.subheader("Simulation Params")
-            sim_steps = st.slider("Time Steps", 50, 1000, 300)
-            arrival_rate = st.slider("Arrival Rate (Poisson λ)", 1.0, 20.0, 5.0)
-            run_sim_btn = st.button("Run Digital Twin Simulation", type="primary", use_container_width=True, key="btn_run_sim")
-
-        with col7:
-            m4 = init_map(map_bounds)
-            output4 = st_folium(m4, width=800, height=600, key="map_sim")
-            
-        if run_sim_btn:
-            with col8:
-                if output4 and 'all_drawings' in output4 and output4['all_drawings']:
-                    geom = output4['all_drawings'][-1]['geometry']
-                    geom_type = geom['type']
-                    coords = geom['coordinates']
-                    if geom_type == 'Polygon':
-                        lonlat_coords = coords[0]
-                    else:
-                        lonlat_coords = coords
-                    
-                    with st.spinner("Analyzing Proposed Infrastructure..."):
-                        # Process geometry quietly to get feasibility and graph
-                        mod_eng = GraphModificationEngine(G)
-                        metrics = process_geometry(geom, buildings, G, feas_eng, mod_eng)
-                    
-                    if not metrics['is_feasible']:
-                        st.error(f"**FEASIBILITY FAILED**: Proposed route intersects {metrics['collisions']} building(s). Cannot run physical simulation on unviable roads.")
-                        st.markdown("### Collision Map")
-                        fail_map = init_map(map_bounds)
-                        if geom_type == 'LineString':
-                            folium.PolyLine([(pt[1], pt[0]) for pt in lonlat_coords], color="orange", weight=4).add_to(fail_map)
-                        elif geom_type == 'Polygon':
-                            folium.Polygon([(pt[1], pt[0]) for pt in lonlat_coords], color="orange", fillOpacity=0.2).add_to(fail_map)
-                        collisions_latlon = metrics['collisions_df'].to_crs("EPSG:4326")
-                        folium.GeoJson(
-                            collisions_latlon,
-                            style_function=lambda x: {'fillColor': 'red', 'color': 'red', 'weight': 2, 'fillOpacity': 0.8}
-                        ).add_to(fail_map)
-                        st_folium(fail_map, width=800, height=400, key="fail_map_tab4", returned_objects=[])
-                    else:
-                        st.success("**Infrastructure Spliced**. Running Digital Twin...")
-                        
-                        modified_G = mod_eng.G  # This contains the proposed infrastructure
-                        
-                        st.write("### Scenario 1: Original Network")
-                        with st.spinner("Simulating Original Network..."):
-                            sim_orig = TrafficSimulator(G, arrival_rate=arrival_rate)
-                            metrics_orig = sim_orig.run_simulation(steps=sim_steps)
-                            st.metric("Avg Travel Time (Orig)", f"{metrics_orig['avg_travel_time']:.1f}s")
-                            st.metric("Throughput (Orig)", f"{metrics_orig['throughput']} veh")
-                            
-                        st.write("### Scenario 2: Modified Network")
-                        with st.spinner("Simulating Modified Network..."):
-                            sim_mod = TrafficSimulator(modified_G, arrival_rate=arrival_rate)
-                            metrics_mod = sim_mod.run_simulation(steps=sim_steps)
-                            st.metric("Avg Travel Time (Mod)", f"{metrics_mod['avg_travel_time']:.1f}s")
-                            st.metric("Throughput (Mod)", f"{metrics_mod['throughput']} veh")
-                            
-                        st.write("### Digital Twin Animation")
-                        with st.spinner("Generating Animation Map..."):
-                            anim_map = init_map(map_bounds)
-                            anim_map_center = [12.9360, 77.5400]
-                            if lonlat_coords:
-                                anim_map_center = [lonlat_coords[0][1], lonlat_coords[0][0]]
-                                folium.PolyLine([(pt[1], pt[0]) for pt in lonlat_coords], color="cyan", weight=4, opacity=0.8).add_to(anim_map)
-                                anim_map.location = anim_map_center
-                                
-                            coords_df = pd.DataFrame(
-                                [(t, x, y, v.type) for v in metrics_mod.get('all_vehicles', []) for t, x, y in v.history],
-                                columns=['t', 'x', 'y', 'type']
-                            )
-                            if not coords_df.empty:
-                                gdf_hist = gpd.GeoDataFrame(coords_df, geometry=gpd.points_from_xy(coords_df.x, coords_df.y), crs=buildings.crs)
-                                gdf_hist = gdf_hist.to_crs("EPSG:4326")
-                                
-                                base_time = datetime.datetime.now().replace(microsecond=0)
-                                features = []
-                                for idx, row in gdf_hist.iterrows():
-                                    lon, lat = row.geometry.x, row.geometry.y
-                                    icon_url = "https://cdn-icons-png.flaticon.com/512/3204/3204121.png" if row['type'] == 'car' else "https://cdn-icons-png.flaticon.com/512/2972/2972185.png"
-                                    feature = {
-                                        "type": "Feature",
-                                        "geometry": {
-                                            "type": "Point",
-                                            "coordinates": [lon, lat]
-                                        },
-                                        "properties": {
-                                            "time": (base_time + datetime.timedelta(seconds=int(row['t']))).isoformat(),
-                                            "icon": "marker",
-                                            "iconstyle": {
-                                                "iconUrl": icon_url,
-                                                "iconSize": [24, 24]
-                                            }
-                                        }
-                                    }
-                                    features.append(feature)
-                                    
-                                TimestampedGeoJson(
-                                    {"type": "FeatureCollection", "features": features},
-                                    transition_time=150,
-                                    period='PT1S',
-                                    duration='PT2S',
-                                    add_last_point=False,
-                                    auto_play=True,
-                                    loop=True,
-                                    max_speed=1,
-                                    loop_button=True,
-                                    time_slider_drag_update=True
-                                ).add_to(anim_map)
-                                
-                            st_folium(anim_map, width=800, height=500, key="map_anim", returned_objects=[])
-                            
-                        st.write("### AI Insights")
-                        if metrics_mod['avg_travel_time'] < metrics_orig['avg_travel_time'] and metrics_orig['avg_travel_time'] > 0:
-                            diff = metrics_orig['avg_travel_time'] - metrics_mod['avg_travel_time']
-                            imp_pct = (diff / max(1, metrics_orig['avg_travel_time'])) * 100
-                            st.success(f"**Improvement!** The proposed route reduced average travel time by **{imp_pct:.1f}%** ({diff:.1f}s faster).")
-                        else:
-                            st.warning("The new infrastructure did not improve overall average travel time in this stochastic run. This might be due to route length or induced demand.")
-                else:
-                    st.warning("Please draw an infrastructure line or polygon on the map first.")
 
 if __name__ == "__main__":
     main()
